@@ -1,0 +1,20 @@
+# Assessment output. A snapshot or report describes real tenant configuration, so treat it as
+# customer data.
+PurviewReport/
+PurviewReport-*/
+report.html
+report.pdf
+report.docx
+findings.json
+snapshot.json
+*-snapshot.json
+purview-snapshot-*.json
+testresults.xml
+
+# Posture records. Rule outcomes rather than tenant content, but still the result of a real run.
+posture-*.json
+
+# Local editor and OS noise.
+.vscode/
+Thumbs.db
+desktop.ini
