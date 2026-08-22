@@ -1043,7 +1043,7 @@ $script:Rules = @(
     }
     @{
         id = 'PA-CC-0001'
-        version = '1.0.0'
+        version = '1.1.0'
         title = 'Communication compliance policies'
         solutionArea = 'CommunicationCompliance'
         severity = 'Low'
@@ -1052,6 +1052,9 @@ $script:Rules = @(
         condition = @{
             collector = 'CommunicationCompliance'
             select = 'Policies'
+            # Workbench drafts come back from the cmdlet but never reach the portal's policy list,
+            # so counting them would report monitoring that is not happening.
+            where = @{ field = 'IsWorkbenchPolicy'; operator = 'eq'; value = $true; negate = $true }
             assert = @{ type = 'isNotEmpty' }
         }
         licensing = @{
@@ -1814,7 +1817,9 @@ function Connect-PurviewSession {
             Connect-SPOService -Url $url @spoArgs -UseSystemBrowser $true -ErrorAction Stop
             # Kept so the remediation script can carry the URL rather than ask for it again.
             $script:SharePointAdminUrl = $url
-            & $record 'SharePoint Online' 'Connected' $(if ($derived) { "Worked out as $url" } else { '' }) 'SharePoint'
+            # Only interesting when it goes wrong, and the failure path already prints what it tried.
+            if ($derived) { Write-Verbose "SharePoint admin URL worked out as $url" }
+            & $record 'SharePoint Online' 'Connected' '' 'SharePoint'
             return $results.ToArray()
         }
         catch {
@@ -2231,7 +2236,9 @@ function Get-PurviewSccCollectorDefinition {
             Map = [ordered]@{
                 Guid = @('Guid', 'Identity'); Name = @('Name', 'DisplayName')
                 Policy = @('ParentPolicyName', 'Policy'); Disabled = @('Disabled')
-                SensitiveTypes = @('ContentContainsSensitiveInformation')
+                # Named for the New- and Set- parameter. AdvancedRule carries the same conditions as
+                # JSON when the rule was built in the portal's advanced editor.
+                SensitiveTypes = @('ContentContainsSensitiveInformation', 'AdvancedRule')
             }
             Optional = @('Policy', 'Disabled', 'SensitiveTypes')
         }
@@ -2272,8 +2279,11 @@ function Get-PurviewSccCollectorDefinition {
         }
         @{
             Collector = 'CommunicationCompliance'; Area = 'CommunicationCompliance'; Cmdlet = 'Get-SupervisoryReviewPolicyV2'; Key = 'Policies'
-            Map = [ordered]@{ Guid = @('Guid', 'Identity'); Name = @('Name', 'DisplayName'); Enabled = @('Enabled') }
-            Optional = @('Enabled')
+            Map = [ordered]@{
+                Guid = @('Guid', 'Identity'); Name = @('Name', 'DisplayName'); Enabled = @('Enabled')
+                IsWorkbenchPolicy = @('IsWorkbenchPolicy'); ProvisioningStatus = @('ProvisioningStatus')
+            }
+            Optional = @('Enabled', 'IsWorkbenchPolicy', 'ProvisioningStatus')
         }
         @{
             Collector = 'DlpRule'; Area = 'DataLossPrevention'; Cmdlet = 'Get-DlpComplianceRule'; Key = 'Rules'
@@ -3040,29 +3050,38 @@ function Test-PurviewPredicate {
     $field = Get-PurviewProperty -InputObject $Predicate -Name 'field'
     $operator = Get-PurviewProperty -InputObject $Predicate -Name 'operator'
     $expected = Get-PurviewProperty -InputObject $Predicate -Name 'value'
+    $negate = [bool](Get-PurviewProperty -InputObject $Predicate -Name 'negate')
 
     $present = Test-PurviewProperty -InputObject $InputObject -Name $field
     $actual = Get-PurviewProperty -InputObject $InputObject -Name $field
 
-    switch ($operator) {
-        'exists' { return $present }
-        'isNullOrEmpty' { return (-not $present) -or $null -eq $actual -or ('' -eq [string]$actual) }
+    $result = & {
+        switch ($operator) {
+            'exists' { return $present }
+            'isNullOrEmpty' { return (-not $present) -or $null -eq $actual -or ('' -eq [string]$actual) }
+        }
+
+        # An absent property cannot satisfy a value comparison; saying so beats inventing a default.
+        if (-not $present) { return $false }
+
+        switch ($operator) {
+            'eq' { return $actual -eq $expected }
+            'ne' { return $actual -ne $expected }
+            'gt' { return $actual -gt $expected }
+            'lt' { return $actual -lt $expected }
+            'ge' { return $actual -ge $expected }
+            'le' { return $actual -le $expected }
+            'contains' { return ([string]$actual).Contains([string]$expected, [StringComparison]::OrdinalIgnoreCase) }
+            'startsWith' { return ([string]$actual).StartsWith([string]$expected, [StringComparison]::OrdinalIgnoreCase) }
+            default { throw "Unsupported predicate operator '$operator'." }
+        }
     }
 
-    # An absent property cannot satisfy a value comparison; saying so beats inventing a default.
-    if (-not $present) { return $false }
-
-    switch ($operator) {
-        'eq' { return $actual -eq $expected }
-        'ne' { return $actual -ne $expected }
-        'gt' { return $actual -gt $expected }
-        'lt' { return $actual -lt $expected }
-        'ge' { return $actual -ge $expected }
-        'le' { return $actual -le $expected }
-        'contains' { return ([string]$actual).Contains([string]$expected, [StringComparison]::OrdinalIgnoreCase) }
-        'startsWith' { return ([string]$actual).StartsWith([string]$expected, [StringComparison]::OrdinalIgnoreCase) }
-        default { throw "Unsupported predicate operator '$operator'." }
-    }
+    # Negation wraps the comparison rather than inverting the operator, so a record missing the
+    # field still fails the inner test and is kept. Excluding what was never returned would read
+    # a silent service as an empty tenant.
+    if ($negate) { return (-not $result) }
+    return [bool]$result
 }
 
 function Format-PurviewPredicate {
@@ -4643,7 +4662,15 @@ function Get-PurviewInventory {
     & $add 'Audit' 'Custom audit log retention policies' 'AuditConfiguration' $auditRetention.Count 'Beyond the Audit (Premium) default of one year for Exchange, SharePoint, OneDrive and Entra, and 180 days for everything else'
 
     $comm = @(Get-PurviewCollectorItem -Snapshot $Snapshot -Collector 'CommunicationCompliance' -Select 'Policies')
-    & $add 'Communication compliance' 'Policies' 'CommunicationCompliance' $comm.Count 'Regulatory and conduct monitoring'
+    $commDraft = @($comm | Where-Object { [bool](Get-PurviewProperty -InputObject $_ -Name 'IsWorkbenchPolicy') })
+    $commDetail = if ($commDraft.Count -eq 1) {
+        'Regulatory and conduct monitoring; one workbench draft the portal does not list is excluded'
+    }
+    elseif ($commDraft.Count -gt 1) {
+        'Regulatory and conduct monitoring; {0} workbench drafts the portal does not list are excluded' -f $commDraft.Count
+    }
+    else { 'Regulatory and conduct monitoring' }
+    & $add 'Communication compliance' 'Policies' 'CommunicationCompliance' ($comm.Count - $commDraft.Count) $commDetail
 
     $classifiers = @(Get-PurviewCollectorItem -Snapshot $Snapshot -Collector 'Classification' -Select 'SensitiveInformationTypes')
     $custom = @($classifiers | Where-Object { [string](Get-PurviewProperty -InputObject $_ -Name 'Publisher') -ne 'Microsoft Corporation' })
@@ -4745,11 +4772,20 @@ function Get-PurviewPrerequisiteState {
             $devices = @(Get-PurviewCollectorItem -Snapshot $Snapshot -Collector 'EndpointDeviceHealth' -Select 'Devices')
             if ($devices.Count -gt 0) {
                 $read = { param($name) [int](Get-PurviewProperty -InputObject $devices[0] -Name $name) }
-                $onboarded = & $read 'Onboarded'
-                $unfit = ($onboarded - (& $read 'ConfigurationValid')) + (& $read 'RealTimeProtectionOff')
-                $state = if ($unfit -gt 0) { 'Needs attention' } else { 'As recommended' }
-                $detail = '{0} onboarded, {1} with endpoint DLP enabled, {2} holding a valid configuration. {3} report Defender real-time protection off.' -f
-                    $onboarded, (& $read 'DlpEnabled'), (& $read 'ConfigurationValid'), (& $read 'RealTimeProtectionOff')
+                # A device appears in this table once Defender for Endpoint knows it. Onboarded to
+                # Purview is the narrower question, and endpoint DLP being enabled is what answers it.
+                $seen = & $read 'Onboarded'
+                $onboarded = & $read 'DlpEnabled'
+                if ($onboarded -eq 0) {
+                    $state = 'Needs attention'
+                    $detail = 'No device has endpoint DLP enabled, so nothing is onboarded to Purview. {0} are known to Defender for Endpoint.' -f $seen
+                }
+                else {
+                    $unfit = ($onboarded - (& $read 'ConfigurationValid')) + (& $read 'RealTimeProtectionOff')
+                    $state = if ($unfit -gt 0) { 'Needs attention' } else { 'As recommended' }
+                    $detail = '{0} onboarded with endpoint DLP enabled, {1} holding a valid configuration. {2} report Defender real-time protection off.' -f
+                        $onboarded, (& $read 'ConfigurationValid'), (& $read 'RealTimeProtectionOff')
+                }
             }
         }
         elseif ($item.ContainsKey('Evidence')) {
@@ -5055,7 +5091,7 @@ function Get-PurviewRemediationPart {
     }
 
     $items = [System.Collections.Generic.List[object]]::new()
-    foreach ($item in @($Prerequisite | Where-Object { $_.State -eq 'Needs attention' -and ($_.Command -or @($_.Candidates).Count -gt 0) })) {
+    foreach ($item in @($Prerequisite | Where-Object { ($_.State -eq 'Needs attention' -and $_.Command) -or @($_.Candidates).Count -gt 0 })) {
         $lines = [System.Collections.Generic.List[string]]::new()
         $lines.Add(('# {0}' -f $item.Name))
         $lines.Add(('#   Now:         {0}' -f $item.Detail))
@@ -5795,7 +5831,9 @@ function ConvertTo-PurviewHtmlReport {
 
     $null = $builder.AppendLine('<h2>Prerequisites and Tenant Opt-ins</h2>')
     $prereq = @(Get-PurviewPrerequisiteState -Snapshot $Snapshot -Finding $Finding)
-    $remediable = @($prereq | Where-Object { $_.State -eq 'Needs attention' -and $_.Command })
+    # A check can pass on one policy being live while others sit in simulation, and those are still
+    # worth offering.
+    $remediable = @($prereq | Where-Object { ($_.State -eq 'Needs attention' -and $_.Command) -or @($_.Candidates).Count -gt 0 })
 
     $attention = @($prereq | Where-Object { $_.State -eq 'Needs attention' }).Count
     $good = @($prereq | Where-Object { $_.State -eq 'As recommended' }).Count
