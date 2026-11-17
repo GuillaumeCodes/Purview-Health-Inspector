@@ -14700,6 +14700,13 @@ function Import-PurviewRuleSet {
 
     $knownAssertions = @('countEquals', 'countGreaterThan', 'countLessThan', 'isEmpty', 'isNotEmpty', 'noDuplicatesOf', 'allHave', 'anyHave', 'noneHave')
     $knownOperators = @('eq', 'ne', 'gt', 'lt', 'ge', 'le', 'contains', 'notContains', 'startsWith', 'exists', 'isNullOrEmpty', 'isNotNullOrEmpty')
+    $valueOperators = @('eq', 'ne', 'gt', 'lt', 'ge', 'le', 'contains', 'notContains', 'startsWith')
+    $countAssertions = @('countEquals', 'countGreaterThan', 'countLessThan')
+    $predicateAssertions = @('allHave', 'anyHave', 'noneHave')
+    $knownSolutionAreas = @(
+        @($script:SolutionMap.Values | ForEach-Object { @($_) })
+        @($script:AlwaysSolutionArea)
+    ) | Where-Object { $_ } | Sort-Object -Unique
     $knownCollectors = @(
         @((Get-PurviewSccCollectorDefinition) | ForEach-Object { [string]$_.Collector })
         'TenantPolicyConfig', 'OcrConfiguration', 'LegacyRetention', 'AuditIngestion'
@@ -14729,13 +14736,23 @@ function Import-PurviewRuleSet {
 
     $rules = [System.Collections.Generic.List[object]]::new()
     foreach ($existing in $script:Rules) { $rules.Add($existing) }
+    $suppliedRuleIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($rule in @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $document -Name 'rules'))) {
         $id = [string](Get-PurviewProperty -InputObject $rule -Name 'id')
         if ([string]::IsNullOrWhiteSpace($id)) { throw 'Every rule needs an id.' }
+        if (-not $suppliedRuleIds.Add($id)) { throw "Rule id '$id' is supplied more than once." }
 
-        foreach ($required in 'title', 'severity', 'recommendation', 'condition') {
+        foreach ($required in 'title', 'solutionArea', 'severity', 'recommendation', 'condition') {
             if (-not (Test-PurviewProperty -InputObject $rule -Name $required)) { throw "Rule '$id' is missing $required." }
+        }
+        $solutionArea = [string](Get-PurviewProperty -InputObject $rule -Name 'solutionArea')
+        if ($solutionArea -notin $knownSolutionAreas) {
+            throw "Rule '$id' uses unknown solution area '$solutionArea'."
+        }
+        $severity = [string](Get-PurviewProperty -InputObject $rule -Name 'severity')
+        if ($severity -notin 'Critical', 'High', 'Medium', 'Low') {
+            throw "Rule '$id' uses unsupported severity '$severity'."
         }
 
         $condition = Get-PurviewProperty -InputObject $rule -Name 'condition'
@@ -14767,24 +14784,51 @@ function Import-PurviewRuleSet {
             $assert = Get-PurviewProperty -InputObject $condition -Name 'assert'
             $type = [string](Get-PurviewProperty -InputObject $assert -Name 'type')
             if ($type -notin $knownAssertions) { throw "Rule '$id' uses an unknown assertion '$type'." }
+            if ($type -in $countAssertions) {
+                if (-not (Test-PurviewProperty -InputObject $assert -Name 'value')) {
+                    throw "Rule '$id' assertion '$type' needs a value."
+                }
+                $threshold = 0L
+                $value = Get-PurviewProperty -InputObject $assert -Name 'value'
+                if (-not [long]::TryParse(
+                    [string]$value,
+                    [System.Globalization.NumberStyles]::Integer,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$threshold) -or $threshold -lt 0) {
+                    throw "Rule '$id' assertion '$type' needs a non-negative whole-number value."
+                }
+            }
+            if ($type -eq 'noDuplicatesOf' -and
+                [string]::IsNullOrWhiteSpace([string](Get-PurviewProperty -InputObject $assert -Name 'field'))) {
+                throw "Rule '$id' assertion 'noDuplicatesOf' needs a field."
+            }
+            if ($type -in $predicateAssertions -and $null -eq (Get-PurviewProperty -InputObject $assert -Name 'where')) {
+                throw "Rule '$id' assertion '$type' needs a predicate in where."
+            }
         }
 
         $validatePredicate = $null
         $validatePredicate = {
             param($predicate)
             if ($null -eq $predicate) { return }
+            if ((Test-PurviewProperty -InputObject $predicate -Name 'negate') -and
+                (Get-PurviewProperty -InputObject $predicate -Name 'negate') -isnot [bool]) {
+                throw "Rule '$id' has a predicate whose negate value is not Boolean."
+            }
             if (Test-PurviewProperty -InputObject $predicate -Name 'all') {
                 $parts = @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $predicate -Name 'all'))
                 if ($parts.Count -eq 0) { throw "Rule '$id' has an empty compound predicate." }
                 foreach ($part in $parts) { & $validatePredicate $part }
                 return
             }
-            if ((Test-PurviewProperty -InputObject $predicate -Name 'negate') -and
-                (Get-PurviewProperty -InputObject $predicate -Name 'negate') -isnot [bool]) {
-                throw "Rule '$id' has a predicate whose negate value is not Boolean."
+            if ([string]::IsNullOrWhiteSpace([string](Get-PurviewProperty -InputObject $predicate -Name 'field'))) {
+                throw "Rule '$id' has a predicate with no field."
             }
             $operator = [string](Get-PurviewProperty -InputObject $predicate -Name 'operator')
             if ($operator -notin $knownOperators) { throw "Rule '$id' uses an unknown operator '$operator'." }
+            if ($operator -in $valueOperators -and -not (Test-PurviewProperty -InputObject $predicate -Name 'value')) {
+                throw "Rule '$id' predicate '$operator' needs a value."
+            }
         }
         & $validatePredicate (Get-PurviewProperty -InputObject $condition -Name 'where')
         & $validatePredicate (Get-PurviewProperty -InputObject $assert -Name 'where')

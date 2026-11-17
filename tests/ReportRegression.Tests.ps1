@@ -15,6 +15,49 @@ Describe 'Report and rule consistency' {
         $rule.version | Should -Be '3.0.0'
     }
 
+    It 'rejects a malformed imported rule before assessment: <Case>' -TestCases @(
+        @{ Case = 'unknown solution area'; Expected = 'unknown solution area' }
+        @{ Case = 'unsupported severity'; Expected = 'unsupported severity' }
+        @{ Case = 'duplicate rule id'; Expected = 'supplied more than once' }
+        @{ Case = 'compound negate is a string'; Expected = 'negate value is not Boolean' }
+        @{ Case = 'predicate has no field'; Expected = 'predicate with no field' }
+        @{ Case = 'predicate value is absent'; Expected = "predicate 'eq' needs a value" }
+        @{ Case = 'count assertion has no value'; Expected = "assertion 'countGreaterThan' needs a value" }
+        @{ Case = 'count assertion value is invalid'; Expected = 'needs a non-negative whole-number value' }
+        @{ Case = 'duplicate assertion has no field'; Expected = "assertion 'noDuplicatesOf' needs a field" }
+        @{ Case = 'item assertion has no predicate'; Expected = "assertion 'allHave' needs a predicate" }
+    ) {
+        param($Case, $Expected)
+
+        $rule = $script:Rules | Where-Object id -eq 'PA-IP-0004' |
+            ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable
+        $rules = @($rule)
+        switch ($Case) {
+            'unknown solution area' { $rule.solutionArea = 'NotARealArea' }
+            'unsupported severity' { $rule.severity = 'Urgent' }
+            'duplicate rule id' {
+                $rules += @($rule | ConvertTo-Json -Depth 20 | ConvertFrom-Json -AsHashtable)
+            }
+            'compound negate is a string' {
+                $rule.condition.where = @{
+                    all = @(@{ field = 'Name'; operator = 'eq'; value = 'EnableAIPIntegration' })
+                    negate = 'true'
+                }
+            }
+            'predicate has no field' { $rule.condition.where = @{ operator = 'eq'; value = 'EnableAIPIntegration' } }
+            'predicate value is absent' { $rule.condition.where = @{ field = 'Name'; operator = 'eq' } }
+            'count assertion has no value' { $rule.condition.assert = @{ type = 'countGreaterThan' } }
+            'count assertion value is invalid' { $rule.condition.assert = @{ type = 'countGreaterThan'; value = 'many' } }
+            'duplicate assertion has no field' { $rule.condition.assert = @{ type = 'noDuplicatesOf' } }
+            'item assertion has no predicate' { $rule.condition.assert = @{ type = 'allHave' } }
+        }
+
+        $path = Join-Path $TestDrive ("invalid-$([guid]::NewGuid()).json")
+        @{ ruleSetVersion = '1.0'; rules = $rules } |
+            ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $path -Encoding utf8
+        { Import-PurviewRuleSet -Path $path } | Should -Throw "*$Expected*"
+    }
+
     It 'uses one interpretation for the finding, checklist and inventory' {
         $snapshot = Get-PurviewDemoSnapshot
         $findings = @(Invoke-PurviewRuleEngine -Snapshot $snapshot)
