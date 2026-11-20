@@ -44,6 +44,7 @@ Describe 'Report and rule consistency' {
                     negate = 'true'
                 }
             }
+
             'predicate has no field' { $rule.condition.where = @{ operator = 'eq'; value = 'EnableAIPIntegration' } }
             'predicate value is absent' { $rule.condition.where = @{ field = 'Name'; operator = 'eq' } }
             'count assertion has no value' { $rule.condition.assert = @{ type = 'countGreaterThan' } }
@@ -201,5 +202,37 @@ Describe 'Report and rule consistency' {
         $html = Get-Content -LiteralPath (Join-Path $folder 'report.html') -Raw
         $html | Should -Not -Match 'PA-SEN-0001|Microsoft Sentinel integration'
         ($output -join "`n") | Should -Not -Match 'FIXTURE_AUTH_|SentinelPurviewIntegration|No accessible Azure subscriptions'
+    }
+}
+
+Describe 'Access diagnostics in persisted reports' {
+    It 'renders missing access guidance and completes a partial <Format> report' -TestCases @(
+        @{ Format = 'full'; Brief = $false }
+        @{ Format = 'brief'; Brief = $true }
+    ) {
+        param($Format, $Brief)
+        Mock Test-PurviewCommand { $false }
+        $denied = Invoke-PurviewCollector -Collector InsiderRiskSharing -SolutionArea InsiderRisk `
+            -Interface 'POST /security/runHuntingQuery' -Kind MicrosoftGraph -RequiredCommand @() `
+            -Collect { throw 'Forbidden: <img src=x onerror=alert(1)> Bearer fixture-secret' }
+        $snapshot = Get-PurviewDemoSnapshot
+        $snapshot.collectorResults = @($snapshot.collectorResults | Where-Object collector -ne 'InsiderRiskSharing') + @($denied)
+        $snapshotPath = Join-Path $TestDrive "access-$Format.json"
+        $snapshot | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $snapshotPath -Encoding utf8
+        $folder = Join-Path $TestDrive "access $Format report"
+        $output = @(& $script:ReportPowerShell -NoLogo -NoProfile -File $script:ReportHarness `
+            -ScriptPath $script:AdvisorPath -ReportFolder $folder -Mode Replay -SnapshotPath $snapshotPath -Brief:$Brief 2>&1)
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        ($output -join "`n") | Should -Match 'Collection access'
+        ($output -join "`n") | Should -Match 'Insider Risk Management Analysts'
+        $html = Get-Content -LiteralPath (Join-Path $folder 'report.html') -Raw
+        $html | Should -Match 'Collection access'
+        $html | Should -Match 'Insider Risk Management Analysts'
+        $html | Should -Match 'ThreatHunting.Read.All'
+        $html | Should -Match '&lt;img'
+        $html | Should -Not -Match '<img src=x|fixture-secret'
+        $findings = Get-Content -LiteralPath (Join-Path $folder 'findings.json') -Raw | ConvertFrom-Json
+        @($findings | Where-Object status -eq 'Pass').Count | Should -BeGreaterThan 0
+        @($findings | Where-Object status -eq 'NotCollected').Count | Should -BeGreaterThan 0
     }
 }

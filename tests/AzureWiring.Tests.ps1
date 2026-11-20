@@ -1,5 +1,17 @@
 BeforeAll {
     . (Join-Path $PSScriptRoot '..\Invoke-PurviewAdvisor.ps1')
+
+    function Get-MgContext {
+        [CmdletBinding()]
+        param()
+        throw 'Unexpected live Graph context read in a test.'
+    }
+
+    function Export-ContentExplorerData {
+        [CmdletBinding()]
+        param([string]$TagType, [string]$TagName, [int]$PageSize)
+        throw 'Unexpected live Content Explorer read in a test.'
+    }
 }
 
 Describe 'Azure identity follows the existing tenant safeguards' {
@@ -242,5 +254,157 @@ Describe 'Prerequisite and cleanup consistency' {
         Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 999991 }
         Should -Invoke Stop-Process -Times 1 -Exactly -ParameterFilter { $Id -eq 999992 }
         Test-Path -LiteralPath $contextPath | Should -BeFalse
+    }
+}
+
+Describe 'Actionable collector access diagnostics' {
+    BeforeEach {
+        $script:GraphSeparate = $false
+        $script:ExpectedTenantId = ''
+        $script:GrantedGraphScope = @($script:GraphScope)
+        $script:ReadReached = $false
+        Mock Test-PurviewCommand { $true }
+        Mock Get-MgContext {
+            [pscustomobject]@{
+                TenantId = '11111111-1111-1111-1111-111111111111'
+                AuthType = 'Delegated'
+                Scopes = $script:GrantedGraphScope
+            }
+        }
+        Mock Start-Sleep { throw 'Access failures must not be retried.' }
+    }
+
+    It 'names an unavailable delegated permission and skips only that read: <Permission>' -TestCases @(
+        @{ Permission = 'LicenseAssignment.Read.All'; Collector = 'Licensing'; Interface = 'GET /subscribedSkus' }
+        @{ Permission = 'GroupSettings.Read.All'; Collector = 'ContainerLabel'; Interface = 'GET /groupSettings' }
+        @{ Permission = 'Application.Read.All'; Collector = 'ProtectedFilesConsent'; Interface = 'GET /servicePrincipals' }
+        @{ Permission = 'ThreatHunting.Read.All'; Collector = 'InsiderRiskSharing'; Interface = 'POST /security/runHuntingQuery' }
+    ) {
+        param($Permission, $Collector, $Interface)
+        $script:GrantedGraphScope = @('User.Read')
+        Test-PurviewConnected -Service Graph | Should -BeTrue
+        $result = Invoke-PurviewCollector -Collector $Collector -SolutionArea Fixture `
+            -Interface $Interface -Kind MicrosoftGraph -RequiredCommand @() -Collect {
+            $script:ReadReached = $true
+            [pscustomobject]@{ Count = 1 }
+        }
+        $result.status | Should -Be 'NotPermitted'
+        $result.errors[0].missingPermissions | Should -Contain $Permission
+        $result.errors[0].message | Should -Match ([regex]::Escape($Permission))
+        $result.errors[0].guidance | Should -Match 'consent'
+        $script:ReadReached | Should -BeFalse
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'accepts a documented higher permission instead of claiming the read scope is missing: <Scope>' -TestCases @(
+        @{ Scope = 'Directory.Read.All'; Collector = 'Licensing'; Interface = 'GET /subscribedSkus' }
+        @{ Scope = 'Directory.Read.All'; Collector = 'ContainerLabel'; Interface = 'GET /groupSettings' }
+        @{ Scope = 'Directory.Read.All'; Collector = 'ProtectedFilesConsent'; Interface = 'GET /servicePrincipals' }
+        @{ Scope = 'ThreatHunting.ReadWrite.All'; Collector = 'EndpointDeviceHealth'; Interface = 'POST /security/runHuntingQuery' }
+    ) {
+        param($Scope, $Collector, $Interface)
+        $script:GrantedGraphScope = @('User.Read', $Scope)
+        $result = Invoke-PurviewCollector -Collector $Collector -SolutionArea Fixture `
+            -Interface $Interface -Kind MicrosoftGraph -RequiredCommand @() -Collect {
+            $script:ReadReached = $true
+            [pscustomobject]@{ Count = 1 }
+        }
+        $result.status | Should -Be 'Success'
+        $result.errors.Count | Should -Be 0
+        $script:ReadReached | Should -BeTrue
+    }
+
+    It 'keeps structured access denials ahead of retry and absence fallbacks: <Signal>' -TestCases @(
+        @{ Signal = 'HTTP status' }
+        @{ Signal = 'Graph error details' }
+    ) {
+        param($Signal)
+        $failure = [System.InvalidOperationException]::new('The resource does not exist. Try again. Bearer fixture-secret')
+        $script:AccessFailure = [System.Management.Automation.ErrorRecord]::new(
+            $failure, 'FixtureFailure', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+        if ($Signal -eq 'HTTP status') { $failure.Data['HttpStatusCode'] = 403 }
+        else {
+            $script:AccessFailure.ErrorDetails = [System.Management.Automation.ErrorDetails]::new(
+                '{"error":{"code":"Authorization_RequestDenied","message":"Access to this resource was denied."}}')
+        }
+        $result = Invoke-PurviewCollector -Collector InsiderRiskSharing -SolutionArea InsiderRisk `
+            -Interface 'POST /security/runHuntingQuery' -Kind MicrosoftGraph -RequiredCommand @() `
+            -AbsenceMeans 'The read was unavailable.' -Collect { throw $script:AccessFailure }
+        $result.status | Should -Be 'NotPermitted'
+        $result.errors[0].guidance | Should -Match 'Security Reader'
+        $result.errors[0].guidance | Should -Match 'Insider Risk Management Analysts'
+        $result.errors[0].missingPermissions.Count | Should -Be 0
+        $result.errors[0].message | Should -Match 'resource does not exist'
+        ($result | ConvertTo-Json -Depth 20) | Should -Not -Match 'fixture-secret'
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'suggests Exchange RBAC for an unavailable cmdlet in a live Exchange session without asserting a missing role' {
+        Mock Test-PurviewCommand { $false } -ParameterFilter { $Name -eq 'Get-RetentionPolicy' }
+        Mock Test-PurviewConnected { $true } -ParameterFilter { $Service -eq 'ExchangeOnline' }
+        $result = Invoke-PurviewCollector -Collector LegacyRetention -SolutionArea DataLifecycleManagement `
+            -Interface 'Get-RetentionPolicy' -Kind ExchangeOnlinePowerShell -RequiredCommand Get-RetentionPolicy `
+            -Collect { throw 'An unavailable read must not run.' }
+        $result.status | Should -Be 'NotPermitted'
+        $result.errors[0].guidance | Should -Match 'View-Only Organization Management'
+        $result.errors[0].missingPermissions.Count | Should -Be 0
+        $result.errors[0].message | Should -Match 'does not establish a missing role|cause is not established'
+    }
+
+    It 'retains successful Content Explorer counts and reports the permission behind a denied tag' {
+        Mock Export-ContentExplorerData { [pscustomobject]@{ TotalCount = 12 } }
+        Mock Export-ContentExplorerData { throw 'Forbidden: this tag is not authorized.' } -ParameterFilter { $TagName -eq 'Denied' }
+        $tags = @('Allowed', 'Denied') | ForEach-Object {
+            [pscustomobject]@{ Type = 'SensitiveInformationType'; Name = $_; UniqueName = $_ }
+        }
+        $result = Get-PurviewClassificationCoverageData -Tag $tags
+        $result.status | Should -Be 'PartialSuccess'
+        $result.data.Tags[0].TotalCount | Should -Be 12
+        $result.errors.Count | Should -Be 1
+        $result.errors[0].guidance | Should -Match 'Content Explorer List Viewer'
+        $result.errors[0].message | Should -Match 'this tag is not authorized'
+        $result.errors[0].missingPermissions.Count | Should -Be 0
+    }
+
+    It 'does not infer delegated permissions from an unverifiable context: <Case>' -TestCases @(
+        @{ Case = 'empty scopes' }
+        @{ Case = 'app-only context' }
+        @{ Case = 'separate Graph process' }
+    ) {
+        param($Case)
+        switch ($Case) {
+            'empty scopes' { $script:GrantedGraphScope = @() }
+            'app-only context' {
+                Mock Get-MgContext { [pscustomobject]@{ AuthType = 'AppOnly'; Scopes = @('User.Read') } }
+            }
+            'separate Graph process' {
+                $script:GrantedGraphScope = @('User.Read')
+                $script:GraphSeparate = $true
+            }
+        }
+        $result = Invoke-PurviewCollector -Collector Licensing -SolutionArea Licensing -Interface 'GET /subscribedSkus' `
+            -Kind MicrosoftGraph -RequiredCommand @() -Collect { [pscustomobject]@{ Count = 1 } }
+        $result.status | Should -Be 'Success'
+        $result.errors.Count | Should -Be 0
+    }
+
+    It 'reports a rejected token as a connection gap rather than suggesting an additional role' {
+        $script:TokenFailure = [System.InvalidOperationException]::new('The current token could not be accepted.')
+        $script:TokenFailure.Data['HttpStatusCode'] = 401
+        $result = Invoke-PurviewCollector -Collector EndpointDeviceHealth -SolutionArea EndpointDlp `
+            -Interface 'POST /security/runHuntingQuery' -Kind MicrosoftGraph -RequiredCommand @() `
+            -Collect { throw $script:TokenFailure }
+        $result.status | Should -Be 'NotConnected'
+        $result.errors[0].guidance | Should -Match 'Reconnect'
+        $result.errors[0].guidance | Should -Not -Match 'Suggested.*Reader'
+        Should -Invoke Start-Sleep -Times 0 -Exactly
+    }
+
+    It 'does not invent permission guidance for an unrelated collector failure' {
+        $result = Invoke-PurviewCollector -Collector Fixture -SolutionArea Audit -Interface Fixture `
+            -Kind MicrosoftGraph -RequiredCommand @() -Collect { throw 'Invalid response schema.' }
+        $result.status | Should -Be 'Failed'
+        $result.errors[0].category | Should -Be 'Unexpected'
+        Test-PurviewProperty -InputObject $result.errors[0] -Name guidance | Should -BeFalse
     }
 }

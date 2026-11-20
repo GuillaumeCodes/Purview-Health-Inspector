@@ -299,7 +299,7 @@ $ErrorActionPreference = 'Stop'
 
 # Record the version in snapshots, findings and posture records to trace results to their checks
 # and distinguish rule changes from tenant changes.
-$script:ToolVersion = '1.63.91'
+$script:ToolVersion = '1.63.92'
 $script:IsSentinelWorker = $SentinelWorker.IsPresent
 
 # Anything the run creates and must undo before it exits.
@@ -2285,12 +2285,7 @@ function Test-PurviewConnected {
                 $tenant = [string](Get-PurviewProperty -InputObject $context -Name 'TenantId')
                 if ($script:ExpectedTenantId -and $tenant -ine $script:ExpectedTenantId) { return $false }
 
-                # Reconnect only when a scope is actually missing, never merely to refresh.
-                $granted = @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $context -Name 'Scopes'))
-                if ($granted.Count -eq 0) { return $true }
-                foreach ($needed in $script:GraphScope) {
-                    if ($granted -notcontains $needed) { return $false }
-                }
+                # A partial grant is still usable. Individual collectors check their own scopes.
                 return $true
             }
             'SharePoint' {
@@ -2913,9 +2908,22 @@ function Connect-PurviewSession {
         # Connecting imports cmdlets, so anything previously recorded as absent may now exist.
         $script:CommandCache = @{}
         $script:ServiceModuleCache = @{}
+        $guidance = ''
+        if ($state -eq 'Failed' -and (Get-PurviewErrorCategory -Message $detail) -eq 'Permission') {
+            $state = 'NotPermitted'
+            $kind = switch ($service) {
+                'Security & Compliance' { 'SecurityAndCompliancePowerShell' }
+                'Exchange Online' { 'ExchangeOnlinePowerShell' }
+                'Microsoft Graph' { 'MicrosoftGraph' }
+                'SharePoint Online' { 'SharePointOnlinePowerShell' }
+                'Azure' { 'AzurePowerShell' }
+            }
+            $guidance = Get-PurviewPermissionGuidance -Kind $kind -Interface 'Sign-in'
+        }
         Write-PurviewStepResult -Status $state
         if ($detail) { Write-Line -Style Dim -Message ('             {0}' -f $detail) }
-        $results.Add([pscustomobject]@{ Service = $service; State = $state; Detail = $detail })
+        if ($guidance) { Write-Line -Style Warn -Message ('             Suggested access to verify: {0}' -f $guidance) }
+        $results.Add([pscustomobject]@{ Service = $service; State = $state; Detail = $detail; Guidance = $guidance })
     }
 
     # Connect Exchange endpoints first: Microsoft.Graph.Authentication and ExchangeOnlineManagement
@@ -3545,14 +3553,179 @@ function Get-PurviewErrorCategory {
     <# .SYNOPSIS Classifies a failure, so a permission gap is not reported as a tenant defect. #>
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
+        [AllowNull()][System.Management.Automation.ErrorRecord]$ErrorRecord = $null
+    )
+
+    if ($null -ne $ErrorRecord) {
+        $exception = $ErrorRecord.Exception
+        for ($depth = 0; $null -ne $exception -and $depth -lt 4; $depth++) {
+            $response = Get-PurviewProperty -InputObject $exception -Name 'Response'
+            $statuses = @(
+                Get-PurviewProperty -InputObject $exception -Name 'ResponseStatusCode'
+                Get-PurviewProperty -InputObject $response -Name 'StatusCode'
+                $exception.Data['HttpStatusCode']
+            )
+            foreach ($status in $statuses) {
+                if ([string]$status -in '403', 'Forbidden') { return 'Permission' }
+                if ([string]$status -in '401', 'Unauthorized') { return 'NotConnected' }
+            }
+            $exception = $exception.InnerException
+        }
+        if ($ErrorRecord.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::PermissionDenied) {
+            return 'Permission'
+        }
+        $details = Get-PurviewProperty -InputObject $ErrorRecord.ErrorDetails -Name 'Message'
+        $Message = "$Message $details $($ErrorRecord.FullyQualifiedErrorId)"
+    }
 
     switch -Regex ($Message) {
-        '(?i)access.?denied|insufficient privileg|unauthorized|forbidden|not authorized' { return 'Permission' }
+        '(?i)access[\s_-]?denied|insufficient (privileg|permission)|unauthorized|forbidden|not authorized|authorization[_ ]?(requestdenied|failed)|\b(HTTP|status(?: code)?)\s*[:=]?\s*\(?403\b|AADSTS(65001|65004|90094)|consent.{0,40}(required|not granted)|admin.{0,20}approval' { return 'Permission' }
         '(?i)throttl|too many requests|\b429\b' { return 'Throttled' }
         '(?i)timed? ?out' { return 'Timeout' }
         '(?i)no .*session|not connected|run connect-' { return 'NotConnected' }
         default { return 'Unexpected' }
+    }
+}
+
+function Get-PurviewGraphPermission {
+    <# .SYNOPSIS Lists the least read scope first, followed by documented alternatives for a collector. #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$Interface)
+
+    switch ($Interface) {
+        'GET /subscribedSkus' {
+            return @('LicenseAssignment.Read.All', 'Directory.Read.All', 'Directory.ReadWrite.All', 'Organization.Read.All', 'Organization.ReadWrite.All')
+        }
+        'GET /groupSettings' {
+            return @('GroupSettings.Read.All', 'GroupSettings.ReadWrite.All', 'Directory.Read.All', 'Directory.ReadWrite.All', 'Group.Read.All', 'Group.ReadWrite.All')
+        }
+        'GET /servicePrincipals' {
+            return @('Application.Read.All', 'Application.ReadWrite.All', 'Directory.Read.All', 'Directory.ReadWrite.All')
+        }
+        'POST /security/runHuntingQuery' {
+            return @('ThreatHunting.Read.All', 'ThreatHunting.ReadWrite.All')
+        }
+    }
+    return @()
+}
+
+function Get-PurviewMissingGraphPermission {
+    <# .SYNOPSIS Identifies a missing delegated scope only when this process has readable grant evidence. #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$Interface)
+
+    $accepted = @(Get-PurviewGraphPermission -Interface $Interface)
+    if ($accepted.Count -eq 0 -or $script:GraphSeparate -or -not (Test-PurviewCommand -Name 'Get-MgContext')) {
+        return @()
+    }
+    try {
+        $context = Get-MgContext -ErrorAction Stop
+        if ([string](Get-PurviewProperty -InputObject $context -Name 'AuthType') -ne 'Delegated') { return @() }
+        $granted = @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $context -Name 'Scopes'))
+        if ($granted.Count -eq 0) { return @() }
+        if (@($accepted | Where-Object { $granted -contains $_ }).Count -eq 0) {
+            return @($accepted[0])
+        }
+    }
+    catch {
+        Write-Verbose ('Graph grants could not be checked before the read: {0}' -f
+            (Get-PurviewSafeErrorMessage -Message $_.Exception.Message))
+    }
+    return @()
+}
+
+function Get-PurviewPermissionGuidance {
+    <# .SYNOPSIS Suggests access to verify; service denials alone do not prove a particular role is missing. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [string]$Interface = '',
+        [string]$Collector = '',
+        [string]$RequiredRole = ''
+    )
+
+    switch ($Kind) {
+        'MicrosoftGraph' {
+            $accepted = @(Get-PurviewGraphPermission -Interface $Interface)
+            $scope = if ($accepted.Count -gt 0) { $accepted[0] } else { $script:GraphScope -join ', ' }
+            $guidance = "Verify delegated $scope consent for the Graph client; required admin consent is separate from the account's roles."
+            if ($Interface -eq 'POST /security/runHuntingQuery') {
+                $guidance += ' Suggested hunting access: the Entra Security Reader role or a Defender unified RBAC role granting advanced hunting, with access to the queried data.'
+                if ($Collector -in 'InsiderRiskSharing', 'DataSecurityTelemetry') {
+                    $guidance += ' DataSecurityBehaviors and DataSecurityEvents also need Insider Risk Management Analysts or Investigators access and approved IRM data sharing with Defender.'
+                }
+                return "$guidance Verify Defender onboarding and table availability before changing access."
+            }
+            return "$guidance Directory Readers is a suggested role for the directory reads. Role scope and tenant restrictions still apply."
+        }
+        'SecurityAndCompliancePowerShell' {
+            if ($Interface -eq 'Export-ContentExplorerData') {
+                return 'Suggested access: Content Explorer List Viewer (Data Classification List Viewer), within the required administrative-unit scope. Content Explorer Content Viewer is not needed for these counts.'
+            }
+            if ($Interface -eq 'Export-ActivityExplorerData') {
+                return 'Suggested access: Information Protection Analysts or another Purview role/group allowing Activity Explorer exports. Compliance Administrator is a broader option; verify administrative-unit scope.'
+            }
+            if ($RequiredRole) {
+                return "Verify Purview RBAC access through $RequiredRole, including role scope. Check module/service availability and applicable licensing before assigning broader access."
+            }
+            return 'Suggested Purview access: Compliance Administrator (a broad option), or a narrower/custom read role exposing the affected cmdlet. Verify role scope, module/service availability and applicable licensing; an unavailable cmdlet does not establish a missing role.'
+        }
+        'ExchangeOnlinePowerShell' {
+            return 'Suggested Exchange access: View-Only Organization Management (View-Only Configuration and View-Only Recipients), or a custom role exposing the affected read. Verify this in Exchange Online; Purview role membership does not establish Exchange RBAC.'
+        }
+        'SharePointOnlinePowerShell' {
+            $guidance = 'Suggested access: SharePoint Administrator, connected to the assessed tenant admin URL.'
+            if ($Interface -eq 'Get-SPOSite') {
+                $guidance += ' Get-SPOSite documentation also specifies site-collection administrator access.'
+            }
+            if ($Interface -eq 'Get-SPODataAccessGovernanceInsight') {
+                $guidance += ' Oversharing metadata also depends on SharePoint Advanced Management access and an existing report.'
+            }
+            return $guidance
+        }
+        'AzurePowerShell' {
+            if ($Interface -eq 'Log Analytics token') {
+                return 'Verify Azure sign-in and any required consent for the Log Analytics API resource, then reconnect to the assessed tenant. Token authorization and workspace-query RBAC are separate; this response does not identify a missing workspace role.'
+            }
+            if ($Interface -like 'Log Analytics query*') {
+                return 'Verify workspace query access to the affected table: OfficeActivity, MicrosoftPurviewInformationProtection or SecurityAlert. Log Analytics Reader, Microsoft Sentinel Reader or a custom query role are suggested options. Protected tables or DataActionsOnly mode need explicit data-read access, such as an appropriately scoped custom role or Privileged Monitoring Data Reader. Resource-only log access may not cover these workspace-context queries.'
+            }
+            if ($Interface -like 'Sentinel*') {
+                return 'Suggested access: Microsoft Sentinel Reader or equivalent inherited read access on the assessed workspace for Sentinel onboarding and data-connector reads. Verify the assignment scope; an additional role is not needed when existing access already permits the read.'
+            }
+            return 'Suggested discovery access: Reader or equivalent read access on the assessed subscriptions and workspaces. Sentinel configuration and Log Analytics queries also need access at their resource/table scopes; existing reader roles can overlap, so do not automatically assign all three.'
+        }
+    }
+    return 'Verify authorization and role scope for the affected service and read; the exact missing role is not established.'
+}
+
+function New-PurviewPermissionError {
+    <# .SYNOPSIS Keeps the service response and access guidance in the ordinary collector error shape. #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$Interface,
+        [string]$Collector = '',
+        [string]$RequiredRole = '',
+        [string[]]$MissingPermission = @()
+    )
+
+    $safe = Get-PurviewSafeErrorMessage -Message $Message
+    $guidance = Get-PurviewPermissionGuidance -Kind $Kind -Interface $Interface -Collector $Collector -RequiredRole $RequiredRole
+    return [pscustomobject]@{
+        message = "$safe Suggested access to verify: $guidance"
+        category = 'NotPermitted'
+        interface = $Interface
+        guidance = $guidance
+        missingPermissions = @($MissingPermission)
+        serviceMessage = $safe
     }
 }
 
@@ -3715,7 +3888,11 @@ function Invoke-PurviewCollector {
     if ($missing.Count -gt 0) {
         # A missing cmdlet on a live compliance session is an availability gap, not proof of
         # missing tenant licensing. Keep the existing NotPermitted status for caller compatibility.
-        $connected = $Kind -eq 'SecurityAndCompliancePowerShell' -and (Test-PurviewConnected -Service 'SecurityAndCompliance')
+        $service = switch ($Kind) {
+            'SecurityAndCompliancePowerShell' { 'SecurityAndCompliance' }
+            'ExchangeOnlinePowerShell' { 'ExchangeOnline' }
+        }
+        $connected = $service -and (Test-PurviewConnected -Service $service)
         if ($connected) {
             $named = if ($RequiredRole) { " Check access through $RequiredRole and module/service availability." } else { ' Check role access and module/service availability; the cause is not established.' }
             if ($null -ne $LicensingRequirement) {
@@ -3723,7 +3900,8 @@ function Invoke-PurviewCollector {
                 if ($RequiredRole) { $named += " Check access through $RequiredRole." }
             }
             $result.status = 'NotPermitted'
-            $result.errors = @([pscustomobject]@{ message = "$($missing -join ', ') is not available to this sign-in, although the Security & Compliance session is live.$named"; category = 'NotPermitted'; interface = $Interface })
+            $result.errors = @(New-PurviewPermissionError -Collector $Collector -Kind $Kind -Interface $Interface `
+                -RequiredRole $RequiredRole -Message "$($missing -join ', ') is not available to this sign-in, although the $service session is live.$named")
             $result.limitations = @(if ($null -ne $LicensingRequirement) {
                     "$SolutionArea was not read because the required cmdlet was unavailable; the cause is not established."
                 }
@@ -3739,6 +3917,18 @@ function Invoke-PurviewCollector {
         $result.errors = @([pscustomobject]@{ message = "$($missing -join ', ') is unavailable.$hint"; category = 'NotConnected'; interface = $Interface })
         $result.limitations = @("$SolutionArea needs a connection this run did not have.")
         return [pscustomobject]$result
+    }
+
+    if ($Kind -eq 'MicrosoftGraph') {
+        $missingPermission = @(Get-PurviewMissingGraphPermission -Interface $Interface)
+        if ($missingPermission.Count -gt 0) {
+            $result.status = 'NotPermitted'
+            $result.errors = @(New-PurviewPermissionError -Collector $Collector -Kind $Kind -Interface $Interface `
+                -MissingPermission $missingPermission `
+                -Message "Missing Graph permission: $($missingPermission -join ', '). The current delegated session lists neither this scope nor a documented alternative. This read was skipped; other available reads continue.")
+            $result.limitations = @("$SolutionArea was not read because the current delegated Graph grant does not permit this endpoint.")
+            return [pscustomobject]$result
+        }
     }
 
     # Retry transient server errors up to three times with increasing delays before reporting failure.
@@ -3766,13 +3956,24 @@ function Invoke-PurviewCollector {
                 $result.limitations = @("Not returned by the service and therefore unknown: $(@($notReturned) -join ', ').")
                 $result.status = 'PartialSuccess'
             }
+            $accessErrors = @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $result.data -Name 'AccessErrors'))
+            if ($accessErrors.Count -gt 0) {
+                $result.errors = $accessErrors
+                $result.status = 'PartialSuccess'
+                $result.limitations += 'Some reads were denied. Available data was retained; review the collection access guidance.'
+            }
+            if (Test-PurviewProperty -InputObject $result.data -Name 'AccessErrors') {
+                if ($result.data -is [System.Collections.IDictionary]) { $null = $result.data.Remove('AccessErrors') }
+                else { $result.data.PSObject.Properties.Remove('AccessErrors') }
+            }
             break
         }
         catch {
             $errorRecord = $_
             $message = Get-PurviewSafeErrorMessage -Message $errorRecord.Exception.Message
+            $category = Get-PurviewErrorCategory -Message $message -ErrorRecord $errorRecord
 
-            if ($attempt -lt 3 -and (Test-PurviewTransientError -Message $message)) {
+            if ($category -notin 'Permission', 'NotConnected' -and $attempt -lt 3 -and (Test-PurviewTransientError -Message $message)) {
                 Write-Verbose "$Collector failed transiently on attempt $attempt : $message"
                 Start-Sleep -Seconds ($attempt * 3)
                 continue
@@ -3793,16 +3994,20 @@ function Invoke-PurviewCollector {
 
             # A service saying it needs a sign-in is a session that was never established, not a
             # fault. It reads as not connected, the same as a cmdlet that was never imported.
-            if (Test-PurviewNotConnectedError -Message $message) {
+            if ($category -ne 'Permission' -and ($category -eq 'NotConnected' -or (Test-PurviewNotConnectedError -Message $message))) {
                 $result.status = 'NotConnected'
                 $result.errors = @([pscustomobject]@{ message = $message; category = 'NotConnected'; interface = $Interface })
+                if ($category -eq 'NotConnected') {
+                    $result.errors[0] | Add-Member -NotePropertyName guidance -NotePropertyValue `
+                        'Reconnect to the assessed tenant and verify the current session/token. An authentication failure does not establish a missing role.'
+                }
                 $result.limitations = @("$SolutionArea needs a connection this run did not have.")
                 break
             }
 
             # Access-related wording does not identify a missing role. Keep it ahead of absence
             # fallbacks, and distinguish hunting service onboarding from permission changes.
-            if ((Get-PurviewErrorCategory -Message $message) -eq 'Permission') {
+            if ($category -eq 'Permission') {
                 $named = if ($RequiredRole) { " Check access through $RequiredRole; the cause is not established." } else { '' }
                 $limitation = "$SolutionArea could not be read after an access-related error; this does not establish a missing role."
                 if ($Kind -eq 'MicrosoftGraph' -and $Interface -eq 'POST /security/runHuntingQuery') {
@@ -3815,7 +4020,10 @@ function Invoke-PurviewCollector {
                     }
                 }
                 $result.status = 'NotPermitted'
-                $result.errors = @([pscustomobject]@{ message = "$message$named"; category = 'NotPermitted'; interface = $Interface })
+                $details = [string](Get-PurviewProperty -InputObject $errorRecord.ErrorDetails -Name 'Message')
+                if ($details) { $message += " Service detail: $(Get-PurviewSafeErrorMessage -Message $details)" }
+                $result.errors = @(New-PurviewPermissionError -Collector $Collector -Kind $Kind -Interface $Interface `
+                    -RequiredRole $RequiredRole -Message "$message$named")
                 $result.limitations = @($limitation)
                 break
             }
@@ -4143,6 +4351,7 @@ function Get-PurviewSentinelM365Data {
 
     $tenantId = [guid]$Context.Tenant.Id
     $limitations = [System.Collections.Generic.List[string]]::new()
+    $accessErrors = [System.Collections.Generic.List[object]]::new()
     $connectors = @()
     $connectorRead = 'Success'
     try {
@@ -4156,6 +4365,10 @@ function Get-PurviewSentinelM365Data {
     catch {
         $connectorRead = 'Failed'
         $limitations.Add('Connector configuration was not read: {0}' -f (Get-PurviewSafeErrorMessage -Message $_.Exception.Message))
+        if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -eq 'Permission') {
+            $accessErrors.Add((New-PurviewPermissionError -Kind AzurePowerShell -Interface 'Sentinel data connectors' `
+                -Message $_.Exception.Message))
+        }
     }
 
     $queryFailure = ''
@@ -4175,7 +4388,12 @@ function Get-PurviewSentinelM365Data {
             throw 'Azure did not return a Log Analytics access token.'
         }
     }
-    catch { $queryFailure = Get-PurviewSafeErrorMessage -Message $_.Exception.Message }
+    catch {
+        $queryFailure = Get-PurviewSafeErrorMessage -Message $_.Exception.Message
+        if ((Get-PurviewErrorCategory -Message $queryFailure -ErrorRecord $_) -eq 'Permission') {
+            $accessErrors.Add((New-PurviewPermissionError -Kind AzurePowerShell -Interface 'Log Analytics token' -Message $queryFailure))
+        }
+    }
 
     $sources = [System.Collections.Generic.List[object]]::new()
     foreach ($definition in @(Get-PurviewSentinelM365Query -TenantId $tenantId -LookbackDays $LookbackDays)) {
@@ -4212,14 +4430,19 @@ function Get-PurviewSentinelM365Data {
         catch {
             $message = Get-PurviewSafeErrorMessage -Message $_.Exception.Message
             $errorDetails = [string](Get-PurviewProperty -InputObject (Get-PurviewProperty -InputObject $_ -Name 'ErrorDetails') -Name 'Message')
+            $category = Get-PurviewErrorCategory -Message $message -ErrorRecord $_
             $missingTable = "(?i)Failed to resolve table (?:or column )?expression named ['`"]$([regex]::Escape($definition.Table))['`"]"
-            if ($errorDetails -match $missingTable -or $message -match $missingTable) {
+            if ($category -ne 'Permission' -and ($errorDetails -match $missingTable -or $message -match $missingTable)) {
                 $source.QueryState = 'Unavailable'
                 $source.ErrorMessage = 'The source table was not available to this query; it may not be collected or accessible.'
             }
             else {
                 $source.ErrorMessage = if ($errorDetails) { Get-PurviewSafeErrorMessage -Message $errorDetails } else { $message }
                 $limitations.Add("$($definition.Name) was not read: $($source.ErrorMessage)")
+                if ($category -eq 'Permission') {
+                    $accessErrors.Add((New-PurviewPermissionError -Kind AzurePowerShell `
+                        -Interface "Log Analytics query $($definition.Table)" -Message $source.ErrorMessage))
+                }
             }
         }
         $sources.Add([pscustomobject]$source)
@@ -4234,6 +4457,7 @@ function Get-PurviewSentinelM365Data {
         Sources = $sources.ToArray()
         LookbackDays = $LookbackDays
         Limitations = $limitations.ToArray()
+        AccessErrors = $accessErrors.ToArray()
     }
 }
 
@@ -4366,6 +4590,7 @@ function Get-PurviewSentinelIntegrationData {
         }
         $subscriptionIds = [System.Collections.Generic.List[string]]::new()
         $subscriptionLimitations = [System.Collections.Generic.List[string]]::new()
+        $accessErrors = [System.Collections.Generic.List[object]]::new()
         $subscriptionDiscoveryComplete = $true
         $workspaceDiscoveryComplete = $true
         try {
@@ -4389,6 +4614,10 @@ function Get-PurviewSentinelIntegrationData {
         catch {
             $subscriptionDiscoveryComplete = $false
             $subscriptionLimitations.Add("Subscription discovery was incomplete; only the active subscription is assured: $(Get-PurviewSafeErrorMessage -Message $_.Exception.Message)")
+            if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -eq 'Permission') {
+                $accessErrors.Add((New-PurviewPermissionError -Kind AzurePowerShell -Interface 'Azure subscription discovery' `
+                    -Message $_.Exception.Message))
+            }
         }
         if ($subscriptionDiscoveryComplete -and $subscriptionIds.Count -eq 0) {
             return [pscustomobject]@{ NoSubscriptions = $true; TenantId = $tenantId; AccountId = [string]$context.Account.Id }
@@ -4407,6 +4636,10 @@ function Get-PurviewSentinelIntegrationData {
             catch {
                 $workspaceDiscoveryComplete = $false
                 $subscriptionLimitations.Add("Workspaces in subscription $candidateSubscriptionId could not be read: $(Get-PurviewSafeErrorMessage -Message $_.Exception.Message)")
+                if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -eq 'Permission') {
+                    $accessErrors.Add((New-PurviewPermissionError -Kind AzurePowerShell -Interface 'Azure workspace discovery' `
+                        -Message $_.Exception.Message))
+                }
             }
         }
 
@@ -4439,6 +4672,7 @@ function Get-PurviewSentinelIntegrationData {
                     $telemetry = Get-PurviewSentinelM365Data -WorkspaceId $workspaceId -CustomerId ([string]$workspaceDetails.CustomerId) `
                         -Context $context -LookbackDays $LookbackDays
                     $results.Add($telemetry)
+                    foreach ($accessError in $telemetry.AccessErrors) { $accessErrors.Add($accessError) }
                     foreach ($limitation in $telemetry.Limitations) {
                         $subscriptionLimitations.Add("$($workspaceId.Split('/')[-1]): $limitation")
                     }
@@ -4446,6 +4680,10 @@ function Get-PurviewSentinelIntegrationData {
             }
             catch {
                 $subscriptionLimitations.Add("Sentinel configuration for workspace $workspaceId could not be read: $(Get-PurviewSafeErrorMessage -Message $_.Exception.Message)")
+                if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -eq 'Permission') {
+                    $accessErrors.Add((New-PurviewPermissionError -Kind AzurePowerShell -Interface 'Sentinel workspace read' `
+                        -Message $_.Exception.Message))
+                }
             }
         }
 
@@ -4466,6 +4704,7 @@ function Get-PurviewSentinelIntegrationData {
             SentinelWorkspaces = $sentinelWorkspaces
             SentinelDiscoveryComplete = $sentinelDiscoveryComplete
             Limitations = $subscriptionLimitations.ToArray()
+            AccessErrors = $accessErrors.ToArray()
         }
     }
     if ($result.status -eq 'Success') {
@@ -4477,6 +4716,10 @@ function Get-PurviewSentinelIntegrationData {
             $result.status = 'PartialSuccess'
             $result.limitations = @($limitations | Select-Object -Unique)
         }
+    }
+    if ($result.status -eq 'PartialSuccess') {
+        $result.limitations += @($result.data.Limitations)
+        $result.limitations = @($result.limitations | Select-Object -Unique)
     }
     return $result
 }
@@ -4752,6 +4995,7 @@ function Get-PurviewSccData {
         -LicensingRequirement $licensingRequirement -LicensingBlock $LicensingBlock `
         -Context $Definition -Collect {
         param($ctx)
+        $accessErrors = [System.Collections.Generic.List[object]]::new()
         # Only switches the installed module actually has are passed, so an older one still collects
         # rather than failing on a parameter it has never heard of.
         $extra = @{}
@@ -4894,6 +5138,10 @@ function Get-PurviewSccData {
                         # absent so report consumers say not read instead of losing every label.
                         Write-Verbose ('Detailed Get-Label failed for {0}: {1}' -f $identity.ToString('D'),
                             (Get-PurviewSafeErrorMessage -Message $_.Exception.Message))
+                        if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -eq 'Permission') {
+                            $accessErrors.Add((New-PurviewPermissionError -Kind SecurityAndCompliancePowerShell `
+                                -Interface $ctx.Cmdlet -Collector $ctx.Collector -Message $_.Exception.Message))
+                        }
                     }
                 }
             }
@@ -4933,6 +5181,7 @@ function Get-PurviewSccData {
                 }
             }
             $data['PropertiesNotReturned'] = @($notReturned | Select-Object -Unique)
+        $data['AccessErrors'] = $accessErrors.ToArray()
         [pscustomobject]$data
     }
 }
@@ -5098,6 +5347,7 @@ function Get-PurviewLegacyRetentionData {
         -RequiredRole 'A role that can read Exchange recipient configuration, such as View-Only Recipients or Retention Management' `
         -AbsenceMeans 'The Exchange messaging records management policies could not be read this run, so retention happening outside Purview goes unreported.' -Collect {
         $missing = [System.Collections.Generic.List[string]]::new()
+        $accessErrors = [System.Collections.Generic.List[object]]::new()
         $policies = @(& (Get-PurviewServiceCommand -Name 'Get-RetentionPolicy' -Service 'ExchangeOnline') -ErrorAction Stop -WarningAction SilentlyContinue | ForEach-Object {
                 $record = [ordered]@{}
                 if (Test-PurviewProperty -InputObject $_ -Name 'Name') {
@@ -5113,7 +5363,9 @@ function Get-PurviewLegacyRetentionData {
 
         $tags = @()
         if (Test-PurviewCommand -Name 'Get-RetentionPolicyTag') {
-            $tags = @(& (Get-PurviewServiceCommand -Name 'Get-RetentionPolicyTag' -Service 'ExchangeOnline') -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | ForEach-Object {
+            $tagErrors = @()
+            try {
+                $tags = @(& (Get-PurviewServiceCommand -Name 'Get-RetentionPolicyTag' -Service 'ExchangeOnline') -ErrorAction SilentlyContinue -ErrorVariable tagErrors -WarningAction SilentlyContinue | ForEach-Object {
                     $record = [ordered]@{}
                     foreach ($field in @(
                             @{ Source = 'Name'; Target = 'Name' }
@@ -5127,6 +5379,18 @@ function Get-PurviewLegacyRetentionData {
                     }
                     [pscustomobject]$record
                 })
+            }
+            catch {
+                if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -ne 'Permission') { throw }
+                $tagErrors = @($_)
+            }
+            foreach ($tagError in $tagErrors) {
+                if ((Get-PurviewErrorCategory -Message $tagError.Exception.Message -ErrorRecord $tagError) -eq 'Permission') {
+                    $missing.Add('Tags')
+                    $accessErrors.Add((New-PurviewPermissionError -Kind ExchangeOnlinePowerShell -Interface 'Get-RetentionPolicyTag' `
+                        -Collector LegacyRetention -Message $tagError.Exception.Message))
+                }
+            }
         }
         else { $missing.Add('Tags') }
 
@@ -5134,6 +5398,7 @@ function Get-PurviewLegacyRetentionData {
             Policies = @($policies)
             Tags = @($tags)
             PropertiesNotReturned = @($missing | Select-Object -Unique)
+            AccessErrors = $accessErrors.ToArray()
         }
     }
 }
@@ -5512,6 +5777,7 @@ function Get-PurviewClassificationCoverageData {
 
         $counts = [System.Collections.Generic.List[object]]::new()
         $requests = [System.Collections.Generic.List[object]]::new()
+        $accessErrors = [System.Collections.Generic.List[object]]::new()
         $failed = [System.Collections.Generic.List[string]]::new()
         $unavailable = [System.Collections.Generic.List[string]]::new()
         $invalidCount = [System.Collections.Generic.List[string]]::new()
@@ -5582,6 +5848,11 @@ function Get-PurviewClassificationCoverageData {
                 $failed.Add($displayName)
                 $unavailable.Add($displayName)
                 $requests.Add([pscustomobject]@{ Tag = $displayName; TagType = 'SensitiveInformationType'; Status = 'Unavailable'; TotalCount = $null })
+                if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -eq 'Permission') {
+                    $accessErrors.Add((New-PurviewPermissionError -Kind SecurityAndCompliancePowerShell `
+                        -Interface 'Export-ContentExplorerData' -Collector ClassificationCoverage `
+                        -Message "Sensitive information type '$displayName' was not read: $($_.Exception.Message)"))
+                }
             }
         }
 
@@ -5601,6 +5872,7 @@ function Get-PurviewClassificationCoverageData {
             TagsWithInvalidTotalCount = $invalidCount.ToArray()
             TagsOmittedByLimit = $omittedNames
             PropertiesNotReturned = @(if ($failed.Count -gt 0) { 'TotalCount' })
+            AccessErrors = $accessErrors.ToArray()
         }
     }
 
@@ -5873,6 +6145,7 @@ function Get-PurviewDataAccessGovernanceData {
         $reports = [System.Collections.Generic.List[object]]::new()
         $refused = [System.Collections.Generic.List[string]]::new()
         $notReturned = [System.Collections.Generic.List[string]]::new()
+        $accessErrors = [System.Collections.Generic.List[object]]::new()
 
         foreach ($entity in $ctx.Entities) {
             try {
@@ -5920,6 +6193,11 @@ function Get-PurviewDataAccessGovernanceData {
             catch {
                 $refused.Add($entity)
                 Write-Verbose "$entity was not readable: $(Get-PurviewSafeErrorMessage -Message $_.Exception.Message)"
+                if ((Get-PurviewErrorCategory -Message $_.Exception.Message -ErrorRecord $_) -eq 'Permission') {
+                    $accessErrors.Add((New-PurviewPermissionError -Kind SharePointOnlinePowerShell `
+                        -Interface 'Get-SPODataAccessGovernanceInsight' -Collector DataAccessGovernance `
+                        -Message "Report entity '$entity' was not read: $($_.Exception.Message)"))
+                }
             }
         }
 
@@ -5929,6 +6207,7 @@ function Get-PurviewDataAccessGovernanceData {
             EntitiesNotRead = $refused.ToArray()
             EntitiesAsked = $ctx.Entities.Count
             PropertiesNotReturned = @($notReturned | Select-Object -Unique)
+            AccessErrors = $accessErrors.ToArray()
         }
     }
 }
@@ -7037,7 +7316,8 @@ function Get-PurviewTenantSnapshot {
         [switch]$IncludeInsights,
         [int]$InsightDays = 30,
         [AllowEmptyCollection()][string[]]$InsightTag = @(),
-        [AllowEmptyCollection()][string[]]$SolutionArea = @()
+        [AllowEmptyCollection()][string[]]$SolutionArea = @(),
+        [AllowEmptyCollection()][object[]]$ConnectionResult = @()
     )
 
     $wanted = @($SolutionArea)
@@ -7166,6 +7446,7 @@ function Get-PurviewTenantSnapshot {
         tenant = $tenant
         licensing = Get-PurviewLicensingBlock -CollectorResult $results.ToArray()
         collectorResults = $results.ToArray()
+        connectionResults = @($ConnectionResult)
     }
 }
 
@@ -10493,6 +10774,49 @@ function Get-PurviewCollectorReason {
     if ($limitations.Count -gt 0) { return [string]$limitations[0] }
 
     return 'No detail was returned.'
+}
+
+function Get-PurviewAccessIssue {
+    <# .SYNOPSIS Reads access diagnostics from live or saved results without querying role assignments. #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([Parameter(Mandatory)][AllowNull()][object]$Snapshot)
+
+    $issues = [System.Collections.Generic.List[object]]::new()
+    foreach ($result in @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $Snapshot -Name 'collectorResults'))) {
+        $source = Get-PurviewProperty -InputObject $result -Name 'source'
+        foreach ($accessError in @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $result -Name 'errors'))) {
+            $category = [string](Get-PurviewProperty -InputObject $accessError -Name 'category')
+            $guidance = [string](Get-PurviewProperty -InputObject $accessError -Name 'guidance')
+            if ($category -ne 'NotPermitted' -and -not ($category -eq 'NotConnected' -and $guidance)) { continue }
+            $interface = [string](Get-PurviewProperty -InputObject $accessError -Name 'interface')
+            if (-not $interface) { $interface = [string](Get-PurviewProperty -InputObject $source -Name 'interface') }
+            $collector = [string](Get-PurviewProperty -InputObject $result -Name 'collector')
+            if (-not $guidance) {
+                $kind = [string](Get-PurviewProperty -InputObject $source -Name 'kind')
+                if (-not $kind) { $kind = 'Unknown' }
+                $guidance = Get-PurviewPermissionGuidance -Kind $kind -Interface $interface -Collector $collector
+            }
+            $message = [string](Get-PurviewProperty -InputObject $accessError -Name 'serviceMessage')
+            if (-not $message) { $message = [string](Get-PurviewProperty -InputObject $accessError -Name 'message') }
+            $issues.Add([pscustomobject]@{
+                Read = $collector
+                Interface = $interface
+                Guidance = $guidance
+                Message = Get-PurviewSafeErrorMessage -Message $message
+            })
+        }
+    }
+    foreach ($connection in @(ConvertTo-PurviewArray -InputObject (Get-PurviewProperty -InputObject $Snapshot -Name 'connectionResults'))) {
+        if ([string](Get-PurviewProperty -InputObject $connection -Name 'State') -ne 'NotPermitted') { continue }
+        $issues.Add([pscustomobject]@{
+            Read = [string](Get-PurviewProperty -InputObject $connection -Name 'Service')
+            Interface = 'Sign-in'
+            Guidance = [string](Get-PurviewProperty -InputObject $connection -Name 'Guidance')
+            Message = Get-PurviewSafeErrorMessage -Message ([string](Get-PurviewProperty -InputObject $connection -Name 'Detail'))
+        })
+    }
+    return $issues.ToArray()
 }
 
 function Get-PurviewWorkloadCoverage {
@@ -15215,6 +15539,19 @@ a:focus-visible,button:focus-visible,input:focus-visible,summary:focus-visible,.
         $null = $builder.AppendLine('</ul>')
     }
 
+    $accessIssues = @(Get-PurviewAccessIssue -Snapshot $Snapshot)
+    if ($accessIssues.Count -gt 0) {
+        $null = $builder.AppendLine('<h2>Collection access</h2>')
+        $null = $builder.AppendLine('<p class="dim">These reads could not complete with the available access. Other available reads continued. Confirmed missing Graph scopes are named in the response; role suggestions are not proof of missing assignments. Verify consent, role scope and service availability before changing access.</p>')
+        $null = $builder.AppendLine('<div class="table-scroll" role="region" aria-label="Collection access" tabindex="0"><table><thead><tr><th scope="col">Affected reads</th><th scope="col">Suggested access to verify</th><th scope="col">Service response</th></tr></thead><tbody>')
+        foreach ($group in @($accessIssues | Group-Object -Property Guidance)) {
+            $reads = @($group.Group | ForEach-Object { '{0} ({1})' -f $_.Read, $_.Interface } | Select-Object -Unique) -join ', '
+            $messages = @($group.Group.Message | Select-Object -Unique | ForEach-Object { "<li>$(Enc $_)</li>" }) -join ''
+            Add-Row @((Enc $reads), (Enc $group.Name), "<ul>$messages</ul>")
+        }
+        $null = $builder.AppendLine('</tbody></table></div>')
+    }
+
     # 3 - only on a re-run that has something real to compare against. On a first assessment the
     # section can say nothing but "no baseline", which reads as a gap in the tenant rather than a
     # gap in the record.
@@ -16550,6 +16887,26 @@ function Show-Summary {
     }
 }
 
+function Show-CollectionAccess {
+    <# .SYNOPSIS Prints actionable access gaps while keeping successful reads available. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][object]$Snapshot)
+
+    $issues = @(Get-PurviewAccessIssue -Snapshot $Snapshot)
+    if ($issues.Count -eq 0) { return }
+    Write-Line -Message ''
+    Write-Line -Style Head -Message '  Collection access'
+    Write-Line -Style Dim -Message '    Available reads continued. Role suggestions are not verified missing assignments.'
+    foreach ($group in @($issues | Group-Object -Property Guidance)) {
+        $reads = @($group.Group | ForEach-Object { '{0} ({1})' -f $_.Read, $_.Interface } | Select-Object -Unique) -join ', '
+        Write-Line -Style Warn -Message "    $reads"
+        Write-Line -Style Dim -Message "      $($group.Name)"
+        foreach ($message in @($group.Group.Message | Select-Object -Unique)) {
+            Write-Line -Style Dim -Message "      Response: $message"
+        }
+    }
+}
+
 function Get-PurviewStatusLabel {
     <#
     .SYNOPSIS
@@ -16797,9 +17154,10 @@ elseif ($Collect -or $bare) {
         return
     }
 
+    $connectionResults = @()
     if (-not $SkipConnect) {
         Write-Line -Style Head -Message '  Signing in'
-        $null = Connect-PurviewSession -TenantAdminUrl $TenantAdminUrl -Environment $Environment -AllowPrompt:(Test-PurviewCanPrompt)
+        $connectionResults = @(Connect-PurviewSession -TenantAdminUrl $TenantAdminUrl -Environment $Environment -AllowPrompt:(Test-PurviewCanPrompt))
         Write-Line -Message ''
 
         $null = Assert-PurviewSessionTenant
@@ -16831,7 +17189,8 @@ elseif ($Collect -or $bare) {
     Write-Line -Message ''
     $collectionClock = [System.Diagnostics.Stopwatch]::StartNew()
     $snapshot = Get-PurviewTenantSnapshot -IncludeSites:$IncludeSites -SiteLimit $SiteLimit -RedactTenant:$RedactTenant `
-        -IncludeInsights:(-not $SkipInsights) -InsightDays $InsightDays -InsightTag $InsightTag -SolutionArea $script:ActiveArea
+        -IncludeInsights:(-not $SkipInsights) -InsightDays $InsightDays -InsightTag $InsightTag -SolutionArea $script:ActiveArea `
+        -ConnectionResult $connectionResults
     $collectionClock.Stop()
     Write-Line -Style Dim -Message ('    Collected in {0:N0}s.' -f $collectionClock.Elapsed.TotalSeconds)
 
@@ -16858,6 +17217,7 @@ Write-Line -Style Dim -Message ('  Checks     {0}' -f $findings.Count)
 Write-Line -Style Dim -Message ('  Time zone  {0}' -f (Get-PurviewTimeZoneContext).Id)
 
 Show-Summary -Finding $findings
+Show-CollectionAccess -Snapshot $snapshot
 Show-Inventory -Snapshot $snapshot
 Show-Checklist -Finding $findings
 Show-Prerequisite -Snapshot $snapshot -Finding $findings

@@ -689,6 +689,8 @@ Describe 'Sentinel Microsoft 365 telemetry evidence' {
         $result.status | Should -Be 'PartialSuccess'
         $result.data.Results[0].ConnectorRead | Should -Be 'Failed'
         ($result.limitations -join ' ') | Should -Match 'AuthorizationFailed'
+        $result.errors[0].guidance | Should -Match 'Microsoft Sentinel Reader'
+        $result.errors[0].message | Should -Match 'Connector read denied'
         (Get-PurviewSentinelIntegrationOutcome -Snapshot @{ collectorResults = @($result) }).Status | Should -Be 'Pass'
     }
 
@@ -699,6 +701,10 @@ Describe 'Sentinel Microsoft 365 telemetry evidence' {
         $result.data.Results[0].Connectors[0].State | Should -Be 'Enabled'
         $result.data.Results[0].Sources[0].EventCount | Should -BeNullOrEmpty
         $result.data.Results[0].Sources[0].ErrorMessage | Should -Match '403'
+        $result.errors.Count | Should -Be 3
+        $result.errors[0].guidance | Should -Match 'Log Analytics Reader'
+        $result.errors[0].guidance | Should -Match 'OfficeActivity'
+        $result.errors[0].guidance | Should -Match 'DataActionsOnly'
         $outcome = Get-PurviewSentinelIntegrationOutcome -Snapshot @{ collectorResults = @($result) }
         $outcome.Status | Should -Be 'NeedsReview'
         ($outcome.Observed -join ' ') | Should -Match 'query access denied'
@@ -894,6 +900,10 @@ Describe 'Sentinel Microsoft 365 telemetry evidence' {
         $outcome.Status | Should -Be 'Pass'
         $outcome.LowConfidence | Should -BeTrue
         ($outcome.Observed -join ' ') | Should -Match 'Insider Risk alerts: not read'
+        $result.errors.Count | Should -Be 1
+        $result.errors[0].interface | Should -Match 'SecurityAlert'
+        $result.errors[0].guidance | Should -Match 'Log Analytics Reader'
+        $result.data.Results[0].Sources[0].EventCount | Should -BeGreaterThan 0
     }
 
     It 'retains configured connectors but does not query when the workspace query ID is invalid' {

@@ -167,8 +167,10 @@ appropriate.
 
 Hunting reads also depend on [Defender XDR onboarding](https://learn.microsoft.com/defender-xdr/m365d-enable).
 Insider-risk tables have additional [role and data-sharing prerequisites](https://learn.microsoft.com/defender-xdr/irm-investigate-alerts-defender).
-If a read is denied, check the reported cause before adding permissions. The inspector does not
-provision services or grant roles to make a read succeed.
+Access-related failures name the affected read, confirmed missing Graph permissions where these
+can be checked, and suggested access to verify. Available reads continue; the console and the
+report's **Collection access** section explain the gaps. Role suggestions are not universal
+requirements or proof of missing assignments. The inspector does not provision services or grant roles.
 
 Oversharing metadata needs an existing report and the relevant
 [SharePoint Advanced Management access](https://learn.microsoft.com/sharepoint/sharepoint-advanced-management-prerequisites).
